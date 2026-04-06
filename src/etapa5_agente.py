@@ -364,11 +364,10 @@ def process_city(
     anchor_map: dict,
     client: anthropic.Anthropic,
 ) -> int:
-    city_state = state["cities"].setdefault(city, {
-        "last_run": None,
-        "processed_files": {},
-        "patterns": None,
-    })
+    defaults = {"last_run": None, "processed_files": {}, "patterns": None}
+    city_state = state["cities"].setdefault(city, {})
+    for k, v in defaults.items():
+        city_state.setdefault(k, v)
 
     pdf_dir = EDITAIS_MATCH_DIR / city
     if not pdf_dir.exists():
