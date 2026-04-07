@@ -41,7 +41,9 @@ STATE_FILE  = CACHE_DIR / "state.json"
 CHECK_INTERVAL_HOURS  = 4      # re-processar cidade se >= 4h desde o último run
 HIGH_MATCH_THRESHOLD  = 50     # PDFs com mais matches são usados na descoberta
 DISCOVERY_SAMPLE_SIZE = 3      # quantos PDFs de alta frequência usar na descoberta
-MAX_CHARS_PER_PAGE    = 15000  # máximo de caracteres enviados por página ao Claude
+MAX_CHARS_PER_PAGE    = 8000   # máximo de caracteres por página enviados ao Claude
+PAGES_PER_BATCH       = 5      # páginas agrupadas por chamada ao Claude
+CALL_DELAY_SECONDS    = 3      # pausa entre chamadas para evitar rate limiting
 CLAUDE_TIMEOUT        = 300    # timeout em segundos para cada chamada ao claude CLI
 
 OUTPUT_COLUMNS = [
@@ -115,7 +117,7 @@ Você está extraindo dados de beneficiários de um documento MCMV.
 
 Cidade: {city}
 Arquivo: {filename}
-Página: {page_num}
+Páginas analisadas: {page_nums}
 
 Padrões de formato descobertos para esta cidade:
 {patterns_json}
@@ -123,17 +125,18 @@ Padrões de formato descobertos para esta cidade:
 Empreendimentos âncora desta cidade:
 {anchor_json}
 
---- TEXTO DA PÁGINA ---
-{page_text}
+--- TEXTO DAS PÁGINAS ---
+{pages_text}
 --- FIM ---
 
-Extraia TODOS os beneficiários mencionados nesta página.
+Extraia TODOS os beneficiários mencionados nestas páginas.
 Regras críticas:
 - NUNCA agregue grupos distintos (Idosos, PCD, Lista Geral etc.) em um único campo.
 - Capture grupo_criterio EXATAMENTE como aparece no texto — não normalize, não traduza.
 - Sorteados, inscritos não sorteados e reserva são categorias distintas — nunca misture.
 - Se houver subgrupos dentro de um grupo, capture em "subgrupo".
 - Se grupo for ambíguo, use grupo_criterio = "AMBIGUO" e coloque o trecho relevante em subgrupo.
+- Inclua o campo pagina_origem com o número da página onde cada beneficiário foi encontrado.
 
 Para cada beneficiário, retorne um objeto com:
 {{
@@ -146,10 +149,11 @@ Para cada beneficiário, retorne um objeto com:
   "grupo_criterio": "texto exato do grupo/critério ou 'AMBIGUO'",
   "subgrupo": "texto exato do subgrupo ou null",
   "empreendimento": "nome do empreendimento âncora mais provável ou 'INDEFINIDO'",
-  "ano_empreendimento": "ano (4 dígitos) ou null"
+  "ano_empreendimento": "ano (4 dígitos) ou null",
+  "pagina_origem": número inteiro da página (1-based)
 }}
 
-Retorne APENAS um array JSON. Se não houver beneficiários nesta página, retorne [].
+Retorne APENAS um array JSON. Se não houver beneficiários, retorne [].
 """
 
 # ─── Chamada ao claude CLI ────────────────────────────────────────────────────
@@ -215,6 +219,13 @@ def load_anchor_map() -> dict[str, list[dict]]:
 
 # ─── PDF ─────────────────────────────────────────────────────────────────────
 
+# Pré-filtro: padrões que indicam presença de CPF/NIS na página
+_CPF_PATTERN = re.compile(
+    r"(?<!\d)\d{11}(?!\d)"           # 11 dígitos isolados
+    r"|(\d{3}\.\d{3}\.\d{3}-\d{2})" # CPF formatado
+)
+
+
 def extract_pages_text(pdf_path: Path) -> list[str]:
     """Retorna lista de textos por página (0-based)."""
     try:
@@ -226,6 +237,11 @@ def extract_pages_text(pdf_path: Path) -> list[str]:
     except Exception as e:
         log.warning(f"  Erro ao abrir {pdf_path.name}: {e}")
         return []
+
+
+def page_has_identifiers(text: str) -> bool:
+    """True se a página contém pelo menos um CPF ou sequência de 11 dígitos."""
+    return bool(_CPF_PATTERN.search(text))
 
 
 # ─── Helpers JSON ────────────────────────────────────────────────────────────
@@ -294,22 +310,38 @@ def extract_from_pdf(
     patterns: dict,
     anchor_info: list[dict],
 ) -> list[dict]:
-    """Extrai registros de beneficiários de um PDF, página a página."""
+    """
+    Extrai registros de beneficiários de um PDF em batches de páginas.
+    Só envia ao Claude páginas que contêm padrões de CPF/NIS.
+    """
     pages_text = extract_pages_text(pdf_path)
     all_rows: list[dict] = []
     uf, municipio = city.split("_", 1) if "_" in city else (city, city)
 
+    # Coleta apenas páginas com identificadores (pré-filtro)
+    candidate_pages: list[tuple[int, str]] = []  # (page_idx 0-based, text)
     for page_idx, text in enumerate(pages_text):
-        if not text.strip():
-            continue
+        if text.strip() and page_has_identifiers(text):
+            candidate_pages.append((page_idx, text))
+
+    log.info(f"  [{city}] {pdf_path.name}: {len(candidate_pages)}/{len(pages_text)} páginas com identificadores")
+
+    # Processa em batches
+    for batch_start in range(0, len(candidate_pages), PAGES_PER_BATCH):
+        batch = candidate_pages[batch_start:batch_start + PAGES_PER_BATCH]
+        page_nums = [p[0] + 1 for p in batch]  # 1-based para exibição
+
+        pages_combined = ""
+        for page_idx, text in batch:
+            pages_combined += f"\n=== PÁGINA {page_idx + 1} ===\n{text[:MAX_CHARS_PER_PAGE]}\n"
 
         prompt = EXTRACTION_PROMPT.format(
             city=city,
             filename=pdf_path.name,
-            page_num=page_idx + 1,
+            page_nums=", ".join(str(p) for p in page_nums),
             patterns_json=json.dumps(patterns, ensure_ascii=False),
             anchor_json=json.dumps(anchor_info, ensure_ascii=False),
-            page_text=text[:MAX_CHARS_PER_PAGE],
+            pages_text=pages_combined,
         )
 
         try:
@@ -322,12 +354,18 @@ def extract_from_pdf(
                 rec["cidade"]         = municipio.replace("_", " ")
                 rec["estado"]         = uf
                 rec["arquivo_origem"] = pdf_path.name
-                rec["pagina_origem"]  = page_idx + 1
+                # Usa pagina_origem do Claude se disponível, senão primeira do batch
+                if not rec.get("pagina_origem"):
+                    rec["pagina_origem"] = page_nums[0]
 
             all_rows.extend(records)
+            if records:
+                log.info(f"  [{city}] págs {page_nums}: {len(records)} registros")
 
         except Exception as e:
-            log.warning(f"  [{city}] Erro pág {page_idx + 1} de {pdf_path.name}: {e}")
+            log.warning(f"  [{city}] Erro batch págs {page_nums} de {pdf_path.name}: {e}")
+
+        time.sleep(CALL_DELAY_SECONDS)
 
     return all_rows
 
