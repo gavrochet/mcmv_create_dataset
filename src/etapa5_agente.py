@@ -477,7 +477,10 @@ def main() -> None:
 
     if args.city:
         log.info(f"=== Modo cidade única: {args.city} ===")
-        state["cities"].setdefault(args.city, {})["last_run"] = None
+        # Força re-processamento completo: zera last_run E processed_files
+        city_entry = state["cities"].setdefault(args.city, {})
+        city_entry["last_run"] = None
+        city_entry["processed_files"] = {}
         try:
             process_city(args.city, state, matches_df, anchor_map)
         finally:
