@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Etapa 5 — Extração Estruturada de Beneficiários MCMV
-Usa Claude API para extrair dados de beneficiários dos PDFs filtrados em editais_match/.
+Usa o claude CLI (subscription) para extrair dados de beneficiários dos PDFs
+filtrados em editais_match/.
 
 Fluxo por cidade:
   1. Discovery: analisa PDFs com >50 matches para descobrir o formato do edital
@@ -16,19 +17,19 @@ import argparse
 import json
 import logging
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import anthropic
 import fitz
 import pandas as pd
 
 # ─── Caminhos ────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-EDITAIS_MATCH_DIR = Path("G:/My Drive/Claude/mcmv_extract_flags/editais_match")
-MATCHES_CSV       = Path("G:/My Drive/Claude/mcmv_extract_flags/logs/matches.csv")
+EDITAIS_MATCH_DIR   = Path("G:/My Drive/Claude/mcmv_extract_flags/editais_match")
+MATCHES_CSV         = Path("G:/My Drive/Claude/mcmv_extract_flags/logs/matches.csv")
 EMPREENDIMENTOS_CSV = Path("G:/My Drive/Claude/mcmv_edital_download/input/empreendimentos.csv")
 OUTPUT_DIR  = BASE_DIR / "output" / "por_cidade"
 CACHE_DIR   = BASE_DIR / "cache"
@@ -37,11 +38,11 @@ STATE_FILE  = CACHE_DIR / "state.json"
 
 # ─── Parâmetros ──────────────────────────────────────────────────────────────
 
-CHECK_INTERVAL_HOURS  = 4     # re-processar cidade se >= 4h desde o último run
-HIGH_MATCH_THRESHOLD  = 50    # PDFs com mais matches são usados na descoberta
-DISCOVERY_SAMPLE_SIZE = 3     # quantos PDFs de alta frequência usar na descoberta
-MAX_CHARS_PER_PAGE    = 15000 # máximo de caracteres enviados por página ao Claude
-MODEL = "claude-sonnet-4-6"
+CHECK_INTERVAL_HOURS  = 4      # re-processar cidade se >= 4h desde o último run
+HIGH_MATCH_THRESHOLD  = 50     # PDFs com mais matches são usados na descoberta
+DISCOVERY_SAMPLE_SIZE = 3      # quantos PDFs de alta frequência usar na descoberta
+MAX_CHARS_PER_PAGE    = 15000  # máximo de caracteres enviados por página ao Claude
+CLAUDE_TIMEOUT        = 120    # timeout em segundos para cada chamada ao claude CLI
 
 OUTPUT_COLUMNS = [
     "cpf", "nis", "nome", "identificador_original",
@@ -151,6 +152,22 @@ Para cada beneficiário, retorne um objeto com:
 Retorne APENAS um array JSON. Se não houver beneficiários nesta página, retorne [].
 """
 
+# ─── Chamada ao claude CLI ────────────────────────────────────────────────────
+
+def claude_call(prompt: str) -> str:
+    """Chama o claude CLI com o prompt e retorna o texto da resposta."""
+    result = subprocess.run(
+        ["claude", "-p", prompt],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=CLAUDE_TIMEOUT,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"claude CLI error: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
 # ─── Estado ──────────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
@@ -210,7 +227,7 @@ def extract_pages_text(pdf_path: Path) -> list[str]:
         return []
 
 
-# ─── Helpers Claude ──────────────────────────────────────────────────────────
+# ─── Helpers JSON ────────────────────────────────────────────────────────────
 
 def _extract_json_object(text: str) -> dict:
     start = text.find("{")
@@ -231,7 +248,7 @@ def _extract_json_array(text: str) -> list:
 def _normalize_id(raw: str | None) -> str | None:
     if not raw:
         return None
-    digits = re.sub(r"\D", "", raw)
+    digits = re.sub(r"\D", "", str(raw))
     return digits.zfill(11) if digits else None
 
 
@@ -241,7 +258,6 @@ def discover_patterns(
     city: str,
     sample: list[tuple[Path, int]],
     anchor_info: list[dict],
-    client: anthropic.Anthropic,
 ) -> dict:
     """
     Analisa PDFs de amostra e retorna dicionário de padrões de formato.
@@ -262,12 +278,8 @@ def discover_patterns(
     )
 
     try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return _extract_json_object(response.content[0].text)
+        response_text = claude_call(prompt)
+        return _extract_json_object(response_text)
     except Exception as e:
         log.warning(f"[{city}] Falha na descoberta de padrões: {e}")
         return {"formato_geral": "desconhecido", "observacoes_extras": str(e)}
@@ -280,7 +292,6 @@ def extract_from_pdf(
     city: str,
     patterns: dict,
     anchor_info: list[dict],
-    client: anthropic.Anthropic,
 ) -> list[dict]:
     """Extrai registros de beneficiários de um PDF, página a página."""
     pages_text = extract_pages_text(pdf_path)
@@ -301,18 +312,12 @@ def extract_from_pdf(
         )
 
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=4096,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            records = _extract_json_array(response.content[0].text)
+            response_text = claude_call(prompt)
+            records = _extract_json_array(response_text)
 
             for rec in records:
-                # Normaliza identificadores
-                rec["cpf"] = _normalize_id(rec.get("cpf"))
-                rec["nis"] = _normalize_id(rec.get("nis"))
-                # Adiciona metadados
+                rec["cpf"]            = _normalize_id(rec.get("cpf"))
+                rec["nis"]            = _normalize_id(rec.get("nis"))
                 rec["cidade"]         = municipio.replace("_", " ")
                 rec["estado"]         = uf
                 rec["arquivo_origem"] = pdf_path.name
@@ -362,7 +367,6 @@ def process_city(
     state: dict,
     matches_df: pd.DataFrame,
     anchor_map: dict,
-    client: anthropic.Anthropic,
 ) -> int:
     defaults = {"last_run": None, "processed_files": {}, "patterns": None}
     city_state = state["cities"].setdefault(city, {})
@@ -399,7 +403,7 @@ def process_city(
         high = [(p, c) for p, c in pdfs_with_counts if c > HIGH_MATCH_THRESHOLD]
         sample = (high if high else pdfs_with_counts)[:DISCOVERY_SAMPLE_SIZE]
 
-        city_state["patterns"] = discover_patterns(city, sample, anchor_info, client)
+        city_state["patterns"] = discover_patterns(city, sample, anchor_info)
         log.info(f"[{city}] Padrão: {city_state['patterns'].get('formato_geral', '?')}")
 
     # ── Extraction ─────────────────────────────────────────────────────────
@@ -412,12 +416,12 @@ def process_city(
     total_rows = 0
     for pdf_path in new_pdfs:
         log.info(f"  [{city}] Extraindo {pdf_path.name}...")
-        rows = extract_from_pdf(pdf_path, city, city_state["patterns"], anchor_info, client)
+        rows = extract_from_pdf(pdf_path, city, city_state["patterns"], anchor_info)
 
         # Fallback sem padrões se retornou vazio
         if not rows and city_state["patterns"]:
             log.info(f"  [{city}] Sem resultados — tentando extração sem padrões...")
-            rows = extract_from_pdf(pdf_path, city, {}, anchor_info, client)
+            rows = extract_from_pdf(pdf_path, city, {}, anchor_info)
 
         if rows:
             save_rows(city, rows)
@@ -434,7 +438,7 @@ def process_city(
 
 # ─── Loop principal ───────────────────────────────────────────────────────────
 
-def run_once(state: dict, matches_df: pd.DataFrame, anchor_map: dict, client: anthropic.Anthropic) -> None:
+def run_once(state: dict, matches_df: pd.DataFrame, anchor_map: dict) -> None:
     cities = [d.name for d in sorted(EDITAIS_MATCH_DIR.iterdir()) if d.is_dir()]
     if not cities:
         log.warning(f"Nenhuma cidade encontrada em {EDITAIS_MATCH_DIR}")
@@ -444,7 +448,7 @@ def run_once(state: dict, matches_df: pd.DataFrame, anchor_map: dict, client: an
     total = 0
     for city in cities:
         try:
-            n = process_city(city, state, matches_df, anchor_map, client)
+            n = process_city(city, state, matches_df, anchor_map)
             total += n
         except Exception as e:
             log.error(f"[{city}] Erro inesperado: {e}", exc_info=True)
@@ -466,20 +470,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    client = anthropic.Anthropic()
-    state  = load_state()
-
+    state      = load_state()
     matches_df = load_matches_info()
     anchor_map = load_anchor_map()
     log.info(f"Matches: {len(matches_df)} linhas | Âncoras: {len(anchor_map)} cidades")
 
     if args.city:
-        # Modo cidade única
         log.info(f"=== Modo cidade única: {args.city} ===")
-        # Força re-processamento zerando last_run da cidade
         state["cities"].setdefault(args.city, {})["last_run"] = None
         try:
-            process_city(args.city, state, matches_df, anchor_map, client)
+            process_city(args.city, state, matches_df, anchor_map)
         finally:
             save_state(state)
         return
@@ -487,14 +487,13 @@ def main() -> None:
     if args.loop:
         log.info(f"Modo loop — recheck a cada {CHECK_INTERVAL_HOURS}h por cidade")
         while True:
-            run_once(state, matches_df, anchor_map, client)
-            # Recarrega dados externos a cada ciclo
+            run_once(state, matches_df, anchor_map)
             matches_df = load_matches_info()
             anchor_map = load_anchor_map()
             log.info(f"Aguardando 30min para próximo ciclo de varredura...")
-            time.sleep(30 * 60)  # verifica novas cidades/PDFs a cada 30min
+            time.sleep(30 * 60)
     else:
-        run_once(state, matches_df, anchor_map, client)
+        run_once(state, matches_df, anchor_map)
 
 
 if __name__ == "__main__":
