@@ -42,7 +42,7 @@ CHECK_INTERVAL_HOURS  = 4      # re-processar cidade se >= 4h desde o último ru
 HIGH_MATCH_THRESHOLD  = 50     # PDFs com mais matches são usados na descoberta
 DISCOVERY_SAMPLE_SIZE = 3      # quantos PDFs de alta frequência usar na descoberta
 MAX_CHARS_PER_PAGE    = 15000  # máximo de caracteres enviados por página ao Claude
-CLAUDE_TIMEOUT        = 120    # timeout em segundos para cada chamada ao claude CLI
+CLAUDE_TIMEOUT        = 300    # timeout em segundos para cada chamada ao claude CLI
 
 OUTPUT_COLUMNS = [
     "cpf", "nis", "nome", "identificador_original",
@@ -155,9 +155,10 @@ Retorne APENAS um array JSON. Se não houver beneficiários nesta página, retor
 # ─── Chamada ao claude CLI ────────────────────────────────────────────────────
 
 def claude_call(prompt: str) -> str:
-    """Chama o claude CLI com o prompt e retorna o texto da resposta."""
+    """Chama o claude CLI com o prompt via stdin e retorna o texto da resposta."""
     result = subprocess.run(
-        ["claude", "-p", prompt],
+        ["claude", "--print"],
+        input=prompt,
         capture_output=True,
         text=True,
         encoding="utf-8",
